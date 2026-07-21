@@ -1,12 +1,4 @@
-{
-  "metadata": {
-    "total_files_merged": 3,
-    "total_accounts_processed": 664,
-    "duplicates_removed": 0,
-    "unique_accounts": 664,
-    "merged_at": "2026-07-21 20:51:25"
-  },
-  "accounts": [
+[
     {
       "uid": "4818358147",
       "password": "CAB3015895840651F344A22F4FF6702510810BE0DC7AF52450DE885E2AC50C1F",
@@ -15944,4 +15936,3 @@
       "credit_score": 100
     }
   ]
-}
