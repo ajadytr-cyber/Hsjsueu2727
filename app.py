@@ -14,7 +14,8 @@ import urllib3
 import random
 
 # Configuration
-TOKEN_BATCH_SIZE = 10000
+TOKEN_BATCH_SIZE = 220
+RETRY_ATTEMPTS = 1  # Number of retry attempts for failed requests
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Global State for Batch Management
@@ -125,7 +126,7 @@ def enc_profile_check_payload(uid):
     encrypted_uid = encrypt_message(protobuf_data)
     return encrypted_uid
 
-async def send_single_like_request(encrypted_like_payload, token_dict, url):
+async def send_single_like_request(encrypted_like_payload, token_dict, url, retry_count=0):
     edata = bytes.fromhex(encrypted_like_payload)
     token_value = token_dict.get("token", "")
     if not token_value:
@@ -146,14 +147,25 @@ async def send_single_like_request(encrypted_like_payload, token_dict, url):
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, data=edata, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                if response.status != 200:
-                    print(f"Like request failed for token {token_value[:10]}... with status: {response.status}")
+                if response.status != 200 and retry_count < RETRY_ATTEMPTS:
+                    # Retry once if failed
+                    print(f"Retrying failed request for token {token_value[:10]}... (Attempt {retry_count + 1})")
+                    await asyncio.sleep(0.5)  # Small delay before retry
+                    return await send_single_like_request(encrypted_like_payload, token_dict, url, retry_count + 1)
                 return response.status
     except asyncio.TimeoutError:
-        print(f"Like request timed out for token {token_value[:10]}...")
+        if retry_count < RETRY_ATTEMPTS:
+            print(f"Timeout, retrying for token {token_value[:10]}... (Attempt {retry_count + 1})")
+            await asyncio.sleep(0.5)
+            return await send_single_like_request(encrypted_like_payload, token_dict, url, retry_count + 1)
+        print(f"Like request timed out for token {token_value[:10]}... after retry")
         return 998
     except Exception as e:
-        print(f"Exception in send_single_like_request for token {token_value[:10]}...: {e}")
+        if retry_count < RETRY_ATTEMPTS:
+            print(f"Exception, retrying for token {token_value[:10]}... (Attempt {retry_count + 1})")
+            await asyncio.sleep(0.5)
+            return await send_single_like_request(encrypted_like_payload, token_dict, url, retry_count + 1)
+        print(f"Exception in send_single_like_request for token {token_value[:10]}... after retry: {e}")
         return 997
 
 async def send_likes_with_token_batch(uid, server_region_for_like_proto, like_api_url, token_batch_to_use):
@@ -317,7 +329,7 @@ def handle_requests():
         "PlayerNickname": player_nickname_from_profile,
         "UID": actual_player_uid_from_profile,
         "status": request_status,
-        "Note": f"Used visit token for profile check and {'random' if use_random else 'rotating'} batch of {len(tokens_for_like_sending)} tokens for like sending."
+        "Note": f"Used visit token for profile check and {'random' if use_random else 'rotating'} batch of {len(tokens_for_like_sending)} tokens for like sending. Retry enabled (1 attempt)."
     }
     return jsonify(response_data)
 
