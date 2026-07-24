@@ -1,6 +1,3 @@
-# STAR LIKE API SRC  
-# POWERED BY : @STAR_GMR
-# CHANNEL : @STAR_METHODE
 from flask import Flask, request, jsonify
 import asyncio
 from Crypto.Cipher import AES
@@ -17,7 +14,8 @@ import urllib3
 import random
 
 # Configuration
-TOKEN_BATCH_SIZE = 1500
+TOKEN_BATCH_SIZE = 220
+RETRY_ATTEMPTS = 1  # Number of retry attempts for failed requests
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Global State for Batch Management
@@ -72,13 +70,20 @@ def get_random_batch_tokens(server_name, all_tokens):
     return random.sample(all_tokens, TOKEN_BATCH_SIZE)
 
 def load_tokens(server_name, for_visit=False):
-    # AB for_visit KA KOI EFFECT NAHI HAI - dono same file se load honge
-    if server_name == "IND":
-        path = "token_ind.json"
-    elif server_name in {"BR", "US", "SAC", "NA"}:
-        path = "token_br.json"
+    if for_visit:
+        if server_name == "IND":
+            path = "token_ind_visit.json"
+        elif server_name in {"BR", "US", "SAC", "NA"}:
+            path = "token_br_visit.json"
+        else:
+            path = "token_bd_visit.json"
     else:
-        path = "token_bd.json"
+        if server_name == "IND":
+            path = "token_ind.json"
+        elif server_name in {"BR", "US", "SAC", "NA"}:
+            path = "token_br.json"
+        else:
+            path = "token_bd.json"
 
     try:
         with open(path, "r") as f:
@@ -121,7 +126,7 @@ def enc_profile_check_payload(uid):
     encrypted_uid = encrypt_message(protobuf_data)
     return encrypted_uid
 
-async def send_single_like_request(encrypted_like_payload, token_dict, url):
+async def send_single_like_request(encrypted_like_payload, token_dict, url, retry_count=0):
     edata = bytes.fromhex(encrypted_like_payload)
     token_value = token_dict.get("token", "")
     if not token_value:
@@ -142,14 +147,25 @@ async def send_single_like_request(encrypted_like_payload, token_dict, url):
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, data=edata, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                if response.status != 200:
-                    print(f"Like request failed for token {token_value[:10]}... with status: {response.status}")
+                if response.status != 200 and retry_count < RETRY_ATTEMPTS:
+                    # Retry once if failed
+                    print(f"Retrying failed request for token {token_value[:10]}... (Attempt {retry_count + 1})")
+                    await asyncio.sleep(0.5)  # Small delay before retry
+                    return await send_single_like_request(encrypted_like_payload, token_dict, url, retry_count + 1)
                 return response.status
     except asyncio.TimeoutError:
-        print(f"Like request timed out for token {token_value[:10]}...")
+        if retry_count < RETRY_ATTEMPTS:
+            print(f"Timeout, retrying for token {token_value[:10]}... (Attempt {retry_count + 1})")
+            await asyncio.sleep(0.5)
+            return await send_single_like_request(encrypted_like_payload, token_dict, url, retry_count + 1)
+        print(f"Like request timed out for token {token_value[:10]}... after retry")
         return 998
     except Exception as e:
-        print(f"Exception in send_single_like_request for token {token_value[:10]}...: {e}")
+        if retry_count < RETRY_ATTEMPTS:
+            print(f"Exception, retrying for token {token_value[:10]}... (Attempt {retry_count + 1})")
+            await asyncio.sleep(0.5)
+            return await send_single_like_request(encrypted_like_payload, token_dict, url, retry_count + 1)
+        print(f"Exception in send_single_like_request for token {token_value[:10]}... after retry: {e}")
         return 997
 
 async def send_likes_with_token_batch(uid, server_region_for_like_proto, like_api_url, token_batch_to_use):
@@ -230,17 +246,20 @@ def handle_requests():
     if not uid_param or not server_name_param:
         return jsonify({"error": "UID and server_name are required"}), 400
 
-    # AB SIRF EK HI FILE SE SARE TOKENS LOAD KARTE HAIN (Regular + Profile check dono ke liye same)
+    # Load visit token for profile checking
+    visit_tokens = load_tokens(server_name_param, for_visit=True)
+    if not visit_tokens:
+        return jsonify({"error": f"No visit tokens loaded for server {server_name_param}."}), 500
+    
+    # Use the first visit token for profile check
+    visit_token = visit_tokens[0] if visit_tokens else None
+    
+    # Load regular tokens for like sending
     all_available_tokens = load_tokens(server_name_param, for_visit=False)
     if not all_available_tokens:
         return jsonify({"error": f"No tokens loaded or token file invalid for server {server_name_param}."}), 500
 
     print(f"Total tokens available for {server_name_param}: {len(all_available_tokens)}")
-
-    # Profile check ke liye bhi yahi se ek token le lo (e.g. first token)
-    token_for_profile_check = all_available_tokens[0] if all_available_tokens else None
-    if not token_for_profile_check:
-        return jsonify({"error": f"Cannot get a token for profile check from {server_name_param}."}), 500
 
     # Get the batch of tokens for like sending
     if use_random:
@@ -252,8 +271,8 @@ def handle_requests():
     
     encrypted_player_uid_for_profile = enc_profile_check_payload(uid_param)
     
-    # Get likes BEFORE using profile check token
-    before_info = make_profile_check_request(encrypted_player_uid_for_profile, server_name_param, token_for_profile_check)
+    # Get likes BEFORE using visit token
+    before_info = make_profile_check_request(encrypted_player_uid_for_profile, server_name_param, visit_token)
     before_like_count = 0
     
     if before_info and hasattr(before_info, 'AccountInfo'):
@@ -282,8 +301,8 @@ def handle_requests():
     else:
         print(f"Skipping like sending for UID {uid_param} as no tokens available for like sending.")
         
-    # Get likes AFTER using profile check token (same token pool se)
-    after_info = make_profile_check_request(encrypted_player_uid_for_profile, server_name_param, token_for_profile_check)
+    # Get likes AFTER using visit token
+    after_info = make_profile_check_request(encrypted_player_uid_for_profile, server_name_param, visit_token)
     after_like_count = before_like_count
     actual_player_uid_from_profile = int(uid_param)
     player_nickname_from_profile = "N/A"
@@ -310,7 +329,7 @@ def handle_requests():
         "PlayerNickname": player_nickname_from_profile,
         "UID": actual_player_uid_from_profile,
         "status": request_status,
-        "Note": f"Used same token pool for profile check and {'random' if use_random else 'rotating'} batch of {len(tokens_for_like_sending)} tokens for like sending."
+        "Note": f"Used visit token for profile check and {'random' if use_random else 'rotating'} batch of {len(tokens_for_like_sending)} tokens for like sending. Retry enabled (1 attempt)."
     }
     return jsonify(response_data)
 
@@ -322,16 +341,13 @@ def token_info():
     
     for server in servers:
         regular_tokens = load_tokens(server, for_visit=False)
-        # Visit tokens ab exist nahi karte, bas same regular tokens hi dikhao
+        visit_tokens = load_tokens(server, for_visit=True)
         info[server] = {
             "regular_tokens": len(regular_tokens),
-            "visit_tokens": "Not used anymore (same as regular tokens)"
+            "visit_tokens": len(visit_tokens)
         }
     
     return jsonify(info)
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=False)
-# STAR LIKE API SRC  
-# POWERED BY : @STAR_GMR
-# CHANNEL : @STAR_METHODE
+    app.run(host='0.0.0.0', port=5001, debug=True, use_reloader=False)
