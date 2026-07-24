@@ -12,10 +12,13 @@ import uid_generator_pb2
 import threading
 import urllib3
 import random
+import time
 
 # Configuration
 TOKEN_BATCH_SIZE = 220
 RETRY_ATTEMPTS = 1  # Number of retry attempts for failed requests
+PROFILE_RETRY_ATTEMPTS = 1  # Increased retry attempts for profile check
+PROFILE_RETRY_DELAY = 0.1  # Increased delay to 0.5 seconds
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Global State for Batch Management
@@ -72,11 +75,11 @@ def get_random_batch_tokens(server_name, all_tokens):
 def load_tokens(server_name, for_visit=False):
     if for_visit:
         if server_name == "IND":
-            path = "token_ind.json"
+            path = "token_ind_visit.json"
         elif server_name in {"BR", "US", "SAC", "NA"}:
-            path = "token_br.json"
+            path = "token_br_visit.json"
         else:
-            path = "token_bd.json"
+            path = "token_bd_visit.json"
     else:
         if server_name == "IND":
             path = "token_ind.json"
@@ -187,7 +190,7 @@ async def send_likes_with_token_batch(uid, server_region_for_like_proto, like_ap
     print(f"Attempted {len(token_batch_to_use)} like sends from batch. Successful: {successful_sends}, Failed/Error: {failed_sends}")
     return results
 
-def make_profile_check_request(encrypted_profile_payload, server_name, token_dict):
+def make_profile_check_request(encrypted_profile_payload, server_name, token_dict, retry_count=0):
     token_value = token_dict.get("token", "")
     if not token_value:
         print("Warning: make_profile_check_request received an empty token_dict.")
@@ -214,15 +217,39 @@ def make_profile_check_request(encrypted_profile_payload, server_name, token_dic
     }
     try:
         response = requests.post(url, data=edata, headers=headers, verify=False, timeout=10)
+        
+        # Handle 429 Too Many Requests specially
+        if response.status_code == 429:
+            if retry_count < PROFILE_RETRY_ATTEMPTS:
+                wait_time = PROFILE_RETRY_DELAY * (retry_count + 1)  # Exponential backoff
+                print(f"Rate limited (429), retrying profile check after {wait_time}s (Attempt {retry_count + 1})")
+                time.sleep(wait_time)
+                return make_profile_check_request(encrypted_profile_payload, server_name, token_dict, retry_count + 1)
+            else:
+                print(f"Rate limited (429) after {PROFILE_RETRY_ATTEMPTS} retries for token {token_value[:10]}...")
+                return None
+        
         response.raise_for_status()
         binary_data = response.content
         decoded_info = decode_protobuf_profile_info(binary_data)
         return decoded_info
     except requests.exceptions.HTTPError as e:
+        if retry_count < PROFILE_RETRY_ATTEMPTS:
+            print(f"HTTP error, retrying profile check for token {token_value[:10]}... (Attempt {retry_count + 1}): {e.response.status_code}")
+            time.sleep(PROFILE_RETRY_DELAY)
+            return make_profile_check_request(encrypted_profile_payload, server_name, token_dict, retry_count + 1)
         print(f"HTTP error in make_profile_check_request for token {token_value[:10]}...: {e.response.status_code} - {e.response.text[:100]}")
     except requests.exceptions.RequestException as e:
+        if retry_count < PROFILE_RETRY_ATTEMPTS:
+            print(f"Request error, retrying profile check for token {token_value[:10]}... (Attempt {retry_count + 1}): {e}")
+            time.sleep(PROFILE_RETRY_DELAY)
+            return make_profile_check_request(encrypted_profile_payload, server_name, token_dict, retry_count + 1)
         print(f"Request error in make_profile_check_request for token {token_value[:10]}...: {e}")
     except Exception as e:
+        if retry_count < PROFILE_RETRY_ATTEMPTS:
+            print(f"Unexpected error, retrying profile check for token {token_value[:10]}... (Attempt {retry_count + 1}): {e}")
+            time.sleep(PROFILE_RETRY_DELAY)
+            return make_profile_check_request(encrypted_profile_payload, server_name, token_dict, retry_count + 1)
         print(f"Unexpected error in make_profile_check_request for token {token_value[:10]}... processing response: {e}")
     return None
 
@@ -242,6 +269,7 @@ def handle_requests():
     uid_param = request.args.get("uid")
     server_name_param = request.args.get("server_name", "").upper()
     use_random = request.args.get("random", "false").lower() == "true"
+    use_random_visit = request.args.get("random_visit", "true").lower() == "true"  # Default random visit tokens
 
     if not uid_param or not server_name_param:
         return jsonify({"error": "UID and server_name are required"}), 400
@@ -251,8 +279,15 @@ def handle_requests():
     if not visit_tokens:
         return jsonify({"error": f"No visit tokens loaded for server {server_name_param}."}), 500
     
-    # Use the first visit token for profile check
-    visit_token = visit_tokens[0] if visit_tokens else None
+    # Randomly shuffle visit tokens if random_visit is enabled
+    if use_random_visit and len(visit_tokens) > 1:
+        shuffled_visit_tokens = visit_tokens.copy()
+        random.shuffle(shuffled_visit_tokens)
+        print(f"Using RANDOM visit tokens for {server_name_param} (total {len(shuffled_visit_tokens)} tokens)")
+        visit_tokens_to_try = shuffled_visit_tokens[:5]  # Try first 5 random tokens
+    else:
+        print(f"Using SEQUENTIAL visit tokens for {server_name_param}")
+        visit_tokens_to_try = visit_tokens[:5]  # Try first 5 sequential tokens
     
     # Load regular tokens for like sending
     all_available_tokens = load_tokens(server_name_param, for_visit=False)
@@ -271,14 +306,28 @@ def handle_requests():
     
     encrypted_player_uid_for_profile = enc_profile_check_payload(uid_param)
     
-    # Get likes BEFORE using visit token
-    before_info = make_profile_check_request(encrypted_player_uid_for_profile, server_name_param, visit_token)
+    # Get likes BEFORE using visit token (with retry and random tokens)
+    before_info = None
     before_like_count = 0
+    working_visit_token = None
+
+    # Try multiple random visit tokens
+    for idx, token in enumerate(visit_tokens_to_try):
+        print(f"Attempting profile check with visit token {idx + 1} (token: {token.get('token', '')[:10]}...)")
+        before_info = make_profile_check_request(encrypted_player_uid_for_profile, server_name_param, token)
+        if before_info and hasattr(before_info, 'AccountInfo'):
+            before_like_count = int(before_info.AccountInfo.Likes)
+            working_visit_token = token  # Use this token for after check too
+            print(f"✓ Success with visit token {idx + 1}")
+            break
+        else:
+            print(f"✗ Visit token {idx + 1} failed, trying next...")
+            time.sleep(0.2)
     
-    if before_info and hasattr(before_info, 'AccountInfo'):
-        before_like_count = int(before_info.AccountInfo.Likes)
-    else:
+    if not before_info:
         print(f"Could not reliably fetch 'before' profile info for UID {uid_param} on {server_name_param}.")
+        # Use first token as fallback
+        working_visit_token = visit_tokens[0] if visit_tokens else None
 
     print(f"UID {uid_param} ({server_name_param}): Likes before = {before_like_count}")
 
@@ -301,11 +350,14 @@ def handle_requests():
     else:
         print(f"Skipping like sending for UID {uid_param} as no tokens available for like sending.")
         
-    # Get likes AFTER using visit token
-    after_info = make_profile_check_request(encrypted_player_uid_for_profile, server_name_param, visit_token)
+    # Get likes AFTER using the working visit token
+    after_info = None
     after_like_count = before_like_count
     actual_player_uid_from_profile = int(uid_param)
     player_nickname_from_profile = "N/A"
+
+    if working_visit_token:
+        after_info = make_profile_check_request(encrypted_player_uid_for_profile, server_name_param, working_visit_token)
 
     if after_info and hasattr(after_info, 'AccountInfo'):
         after_like_count = int(after_info.AccountInfo.Likes)
@@ -322,6 +374,7 @@ def handle_requests():
     likes_increment = after_like_count - before_like_count
     request_status = 1 if likes_increment > 0 else (2 if likes_increment == 0 else 3)
 
+    visit_mode = "RANDOM" if use_random_visit else "SEQUENTIAL"
     response_data = {
         "LikesGivenByAPI": likes_increment,
         "LikesafterCommand": after_like_count,
@@ -329,8 +382,69 @@ def handle_requests():
         "PlayerNickname": player_nickname_from_profile,
         "UID": actual_player_uid_from_profile,
         "status": request_status,
-        "Note": f"Used visit token for profile check and {'random' if use_random else 'rotating'} batch of {len(tokens_for_like_sending)} tokens for like sending. Retry enabled (1 attempt)."
+        "Note": f"Used {visit_mode} visit tokens for profile check (tried {len(visit_tokens_to_try)} tokens with {PROFILE_RETRY_ATTEMPTS} retry each, {PROFILE_RETRY_DELAY}s delay) and {'random' if use_random else 'rotating'} batch of {len(tokens_for_like_sending)} tokens for like sending."
     }
+    return jsonify(response_data)
+
+@app.route('/profile_info', methods=['GET'])
+def get_profile_info():
+    """Separate endpoint to get profile information only"""
+    uid_param = request.args.get("uid")
+    server_name_param = request.args.get("server_name", "").upper()
+    use_random_visit = request.args.get("random_visit", "true").lower() == "true"
+
+    if not uid_param or not server_name_param:
+        return jsonify({"error": "UID and server_name are required"}), 400
+
+    # Load visit tokens
+    visit_tokens = load_tokens(server_name_param, for_visit=True)
+    if not visit_tokens:
+        return jsonify({"error": f"No visit tokens loaded for server {server_name_param}."}), 500
+    
+    # Randomly shuffle visit tokens if random_visit is enabled
+    if use_random_visit and len(visit_tokens) > 1:
+        shuffled_visit_tokens = visit_tokens.copy()
+        random.shuffle(shuffled_visit_tokens)
+        print(f"Using RANDOM visit tokens for profile info {server_name_param}")
+        visit_tokens_to_try = shuffled_visit_tokens[:5]
+    else:
+        print(f"Using SEQUENTIAL visit tokens for profile info {server_name_param}")
+        visit_tokens_to_try = visit_tokens[:5]
+    
+    encrypted_player_uid_for_profile = enc_profile_check_payload(uid_param)
+    
+    # Try multiple visit tokens
+    profile_info = None
+    working_token = None
+    
+    for idx, token in enumerate(visit_tokens_to_try):
+        print(f"Attempting profile info with visit token {idx + 1}")
+        profile_info = make_profile_check_request(encrypted_player_uid_for_profile, server_name_param, token)
+        if profile_info and hasattr(profile_info, 'AccountInfo'):
+            working_token = token
+            print(f"✓ Success with visit token {idx + 1}")
+            break
+        else:
+            print(f"✗ Visit token {idx + 1} failed, trying next...")
+            time.sleep(0.2)
+    
+    if not profile_info or not hasattr(profile_info, 'AccountInfo'):
+        return jsonify({"error": "Could not fetch profile information"}), 404
+    
+    # Extract profile data
+    account_info = profile_info.AccountInfo
+    response_data = {
+        "UID": int(account_info.UID),
+        "PlayerNickname": str(account_info.PlayerNickname) if account_info.PlayerNickname else "N/A",
+        "Likes": int(account_info.Likes),
+        "Region": str(account_info.Region) if hasattr(account_info, 'Region') else "N/A",
+        "Level": int(account_info.Level) if hasattr(account_info, 'Level') else 0,
+        "Rank": int(account_info.Rank) if hasattr(account_info, 'Rank') else 0,
+        "Server": server_name_param,
+        "TokenUsed": working_token.get("token", "")[:20] + "..." if working_token else "None",
+        "Note": f"Profile fetched using {'random' if use_random_visit else 'sequential'} visit tokens (tried {len(visit_tokens_to_try)} tokens)"
+    }
+    
     return jsonify(response_data)
 
 @app.route('/token_info', methods=['GET'])
